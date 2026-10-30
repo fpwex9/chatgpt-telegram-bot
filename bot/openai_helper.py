@@ -378,8 +378,10 @@ class OpenAIHelper:
         """
         try:
             with open(filename, "rb") as audio:
-                prompt_text = self.config['whisper_prompt']
-                result = await self.client.audio.transcriptions.create(model="whisper-1", file=audio, prompt=prompt_text)
+                # whisper-1 is deprecated (shutdown 2027-02-26); gpt-transcribe is OpenAI's recommended model (2026-10-30)
+                kwargs = {'prompt': self.config['whisper_prompt']} if self.config['whisper_prompt'] else {}
+                result = await self.client.audio.transcriptions.create(
+                    model=os.environ.get('TRANSCRIBE_MODEL', 'gpt-transcribe'), file=audio, **kwargs)
                 return result.text
         except Exception as e:
             logging.exception(e)

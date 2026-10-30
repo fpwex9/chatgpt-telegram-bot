@@ -402,7 +402,7 @@ class ChatGPTTelegramBot:
                 if self.config['voice_reply_transcript'] and not response_to_transcription:
 
                     # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\""
+                    transcript_output = transcript
                     chunks = split_into_chunks(transcript_output)
 
                     for index, transcript_chunk in enumerate(chunks):
@@ -421,10 +421,9 @@ class ChatGPTTelegramBot:
                         self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
 
                     # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = (
-                        f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\"\n\n"
-                        f"_{localized_text('answer', bot_language)}:_\n{response}"
-                    )
+                    transcript_output = f"{transcript}\n\n_{localized_text('answer', bot_language)}:_\n{response}"
+
+
                     chunks = split_into_chunks(transcript_output)
 
                     for index, transcript_chunk in enumerate(chunks):
