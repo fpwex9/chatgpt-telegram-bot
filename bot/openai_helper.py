@@ -282,7 +282,7 @@ class OpenAIHelper:
                     self.__add_to_history(chat_id, role="user", content=query)
                 except Exception as e:
                     logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
-                    self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
+                    self.__trim_history(chat_id)
 
             model = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
             common_args = {
@@ -295,8 +295,8 @@ class OpenAIHelper:
             if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
                 functions = self.plugin_manager.get_functions_specs()
                 if len(functions) > 0:
-                    common_args['functions'] = self.plugin_manager.get_functions_specs()
-                    common_args['function_call'] = 'auto'
+                    common_args['tools'] = [{'type': 'function', 'function': spec} for spec in functions]
+                    common_args['tool_choice'] = 'auto'
             return await self.client.chat.completions.create(**common_args)
 
         except openai.RateLimitError as e:
@@ -309,36 +309,52 @@ class OpenAIHelper:
             raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
 
     async def __handle_function_call(self, chat_id, response, stream=False, times=0, plugins_used=()):
-        function_name = ''
-        arguments = ''
+        tool_calls = {}
         if stream:
+            buffered = []
+
+            async def replay_response():
+                for item in buffered:
+                    yield item
+                async for item in response:
+                    yield item
+
             async for item in response:
+                buffered.append(item)
                 if len(item.choices) > 0:
                     first_choice = item.choices[0]
-                    if first_choice.delta and first_choice.delta.function_call:
-                        if first_choice.delta.function_call.name:
-                            function_name += first_choice.delta.function_call.name
-                        if first_choice.delta.function_call.arguments:
-                            arguments += first_choice.delta.function_call.arguments
-                    elif first_choice.finish_reason and first_choice.finish_reason == 'function_call':
+                    if first_choice.delta and first_choice.delta.tool_calls:
+                        for delta in first_choice.delta.tool_calls:
+                            tool_call = tool_calls.setdefault(delta.index, {
+                                'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}
+                            })
+                            if delta.id:
+                                tool_call['id'] += delta.id
+                            if delta.function:
+                                if delta.function.name:
+                                    tool_call['function']['name'] += delta.function.name
+                                if delta.function.arguments:
+                                    tool_call['function']['arguments'] += delta.function.arguments
+                    if first_choice.finish_reason == 'tool_calls':
                         break
-                    else:
-                        return response, plugins_used
-                else:
-                    return response, plugins_used
+                    if not tool_calls and (first_choice.delta.content or first_choice.finish_reason):
+                        return replay_response(), plugins_used
+            if not tool_calls:
+                return replay_response(), plugins_used
+            # Keep the existing single-function behaviour; only record the call we execute.
+            tool_call = tool_calls[min(tool_calls)]
         else:
             if len(response.choices) > 0:
                 first_choice = response.choices[0]
-                if first_choice.message.function_call:
-                    if first_choice.message.function_call.name:
-                        function_name += first_choice.message.function_call.name
-                    if first_choice.message.function_call.arguments:
-                        arguments += first_choice.message.function_call.arguments
+                if first_choice.message.tool_calls:
+                    tool_call = first_choice.message.tool_calls[0].model_dump()
                 else:
                     return response, plugins_used
             else:
                 return response, plugins_used
 
+        function_name = tool_call['function']['name']
+        arguments = tool_call['function']['arguments']
         logging.info(f'Calling function {function_name} with arguments {arguments}')
         function_response = await self.plugin_manager.call_function(function_name, self, arguments)
 
@@ -346,17 +362,17 @@ class OpenAIHelper:
             plugins_used += (function_name,)
 
         if is_direct_result(function_response):
-            self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name,
+            self.__add_function_call_to_history(chat_id=chat_id, tool_call=tool_call,
                                                 content=json.dumps({'result': 'Done, the content has been sent'
                                                                               'to the user.'}))
             return function_response, plugins_used
 
-        self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name, content=function_response)
+        self.__add_function_call_to_history(chat_id=chat_id, tool_call=tool_call, content=function_response)
         response = await self.client.chat.completions.create(
             model=self.config['model'],
             messages=self.conversations[chat_id],
-            functions=self.plugin_manager.get_functions_specs(),
-            function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
+            tools=[{'type': 'function', 'function': spec} for spec in self.plugin_manager.get_functions_specs()],
+            tool_choice='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
             stream=stream,
             **({'reasoning_effort': self.config['reasoning_effort']}
                if self.config.get('reasoning_effort') and not is_legacy_model(self.config['model'])
@@ -476,7 +492,7 @@ class OpenAIHelper:
                     self.conversations[chat_id] += [last]
                 except Exception as e:
                     logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
-                    self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
+                    self.__trim_history(chat_id)
 
             message = {'role':'user', 'content':content}
 
@@ -625,11 +641,19 @@ class OpenAIHelper:
         max_age_minutes = self.config['max_conversation_age_minutes']
         return last_updated < now - datetime.timedelta(minutes=max_age_minutes)
 
-    def __add_function_call_to_history(self, chat_id, function_name, content):
+    def __add_function_call_to_history(self, chat_id, tool_call, content):
         """
         Adds a function call to the conversation history
         """
-        self.conversations[chat_id].append({"role": "function", "name": function_name, "content": content})
+        self.conversations[chat_id].append({"role": "assistant", "content": None, "tool_calls": [tool_call]})
+        self.conversations[chat_id].append({"role": "tool", "tool_call_id": tool_call['id'], "content": content})
+
+    def __trim_history(self, chat_id):
+        history = self.conversations[chat_id][-self.config['max_history_size']:]
+        # A suffix may start inside a tool exchange. Drop its orphaned results.
+        while history and history[0]['role'] == 'tool':
+            history.pop(0)
+        self.conversations[chat_id] = history
 
     def __add_to_history(self, chat_id, role, content):
         """
@@ -704,6 +728,8 @@ class OpenAIHelper:
         for message in messages:
             num_tokens += tokens_per_message
             for key, value in message.items():
+                if value is None:
+                    continue
                 if key == 'content':
                     if isinstance(value, str):
                         num_tokens += len(encoding.encode(value))
@@ -714,6 +740,8 @@ class OpenAIHelper:
                                 num_tokens += self.__count_tokens_vision(image)
                             else:
                                 num_tokens += len(encoding.encode(message1['text']))
+                elif key == 'tool_calls':
+                    num_tokens += len(encoding.encode(json.dumps(value)))
                 else:
                     num_tokens += len(encoding.encode(value))
                     if key == "name":
