@@ -119,3 +119,11 @@ def test_count_tokens_with_image_for_new_vision_model():
         {'type': 'text', 'text': 'what is this'},
         {'type': 'image_url', 'image_url': {'url': encode_image(buf), 'detail': 'low'}}]})
     assert helper.get_conversation_stats(1)[1] > 85
+
+
+def test_reasoning_effort_sent_for_current_models_only():
+    config = {**CONFIG, 'reasoning_effort': 'none'}
+    assert chat_completion_params('gpt-6-luna', config, 100, 1)['reasoning_effort'] == 'none'
+    assert 'reasoning_effort' not in chat_completion_params('gpt-4o-mini', config, 100, 1)
+    assert 'reasoning_effort' not in chat_completion_params('o1', config, 100, 1)
+    assert 'reasoning_effort' not in chat_completion_params('gpt-6-luna', {**CONFIG, 'reasoning_effort': ''}, 100, 1)

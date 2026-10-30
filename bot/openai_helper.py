@@ -54,6 +54,10 @@ def chat_completion_params(model: str, config: dict, max_tokens: int, n: int) ->
             'frequency_penalty': config['frequency_penalty'],
         }
     params = {'max_completion_tokens': max_tokens}
+    # function calling in Chat Completions requires reasoning_effort 'none' for current models
+    # (API error otherwise); o1 models don't accept 'none'
+    if config.get('reasoning_effort') and model not in O_MODELS:
+        params['reasoning_effort'] = config['reasoning_effort']
     if config['temperature'] != 1.0:
         params['temperature'] = config['temperature']
     if config['presence_penalty'] != 0.0:
@@ -353,7 +357,10 @@ class OpenAIHelper:
             messages=self.conversations[chat_id],
             functions=self.plugin_manager.get_functions_specs(),
             function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
-            stream=stream
+            stream=stream,
+            **({'reasoning_effort': self.config['reasoning_effort']}
+               if self.config.get('reasoning_effort') and not is_legacy_model(self.config['model'])
+               and self.config['model'] not in O_MODELS else {})
         )
         return await self.__handle_function_call(chat_id, response, stream, times + 1, plugins_used)
 
