@@ -29,6 +29,46 @@ GPT_4O_MODELS = ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest")
 O_MODELS = ("o1", "o1-mini", "o1-preview")
 GPT_ALL_MODELS = GPT_3_MODELS + GPT_3_16K_MODELS + GPT_4_MODELS + GPT_4_32K_MODELS + GPT_4_VISION_MODELS + GPT_4_128K_MODELS + GPT_4O_MODELS + O_MODELS
 
+
+def is_legacy_model(model: str) -> bool:
+    """
+    Whether the model is one of the 2024 models listed above. Any other name (gpt-5*, gpt-6*, ...)
+    is treated as a current model.
+    """
+    return model in GPT_ALL_MODELS and model not in O_MODELS
+
+
+def chat_completion_params(model: str, config: dict, max_tokens: int, n: int) -> dict:
+    """
+    Model-dependent Chat Completions parameters.
+    Legacy models keep the old behaviour. For current models `max_completion_tokens` is used
+    (`max_tokens` is deprecated in favor of it) and sampling parameters are only sent when they
+    differ from the API defaults, so models that don't accept them still work out of the box.
+    """
+    if is_legacy_model(model):
+        return {
+            'temperature': config['temperature'],
+            'n': n,
+            'max_tokens': max_tokens,
+            'presence_penalty': config['presence_penalty'],
+            'frequency_penalty': config['frequency_penalty'],
+        }
+    params = {'max_completion_tokens': max_tokens}
+    # function calling in Chat Completions requires reasoning_effort 'none' for current models
+    # (API error otherwise); o1 models don't accept 'none'
+    if config.get('reasoning_effort') and model not in O_MODELS:
+        params['reasoning_effort'] = config['reasoning_effort']
+    if config['temperature'] != 1.0:
+        params['temperature'] = config['temperature']
+    if config['presence_penalty'] != 0.0:
+        params['presence_penalty'] = config['presence_penalty']
+    if config['frequency_penalty'] != 0.0:
+        params['frequency_penalty'] = config['frequency_penalty']
+    if n != 1:
+        params['n'] = n
+    return params
+
+
 def default_max_tokens(model: str) -> int:
     """
     Gets the default number of max tokens for the given model.
@@ -54,6 +94,9 @@ def default_max_tokens(model: str) -> int:
         return 4096
     elif model in O_MODELS:
         return 4096
+    # current models: an upper bound only (billing is per generated token), large enough
+    # that reasoning tokens don't eat the whole answer
+    return 16384
 
 
 def are_functions_available(model: str) -> bool:
@@ -241,15 +284,11 @@ class OpenAIHelper:
                     logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
                     self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
 
-            max_tokens_str = 'max_completion_tokens' if self.config['model'] in O_MODELS else 'max_tokens'
+            model = self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model']
             common_args = {
-                'model': self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model'],
+                'model': model,
                 'messages': self.conversations[chat_id],
-                'temperature': self.config['temperature'],
-                'n': self.config['n_choices'],
-                max_tokens_str: self.config['max_tokens'],
-                'presence_penalty': self.config['presence_penalty'],
-                'frequency_penalty': self.config['frequency_penalty'],
+                **chat_completion_params(model, self.config, self.config['max_tokens'], self.config['n_choices']),
                 'stream': stream
             }
 
@@ -318,7 +357,10 @@ class OpenAIHelper:
             messages=self.conversations[chat_id],
             functions=self.plugin_manager.get_functions_specs(),
             function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
-            stream=stream
+            stream=stream,
+            **({'reasoning_effort': self.config['reasoning_effort']}
+               if self.config.get('reasoning_effort') and not is_legacy_model(self.config['model'])
+               and self.config['model'] not in O_MODELS else {})
         )
         return await self.__handle_function_call(chat_id, response, stream, times + 1, plugins_used)
 
@@ -441,11 +483,8 @@ class OpenAIHelper:
             common_args = {
                 'model': self.config['vision_model'],
                 'messages': self.conversations[chat_id][:-1] + [message],
-                'temperature': self.config['temperature'],
-                'n': 1, # several choices is not implemented yet
-                'max_tokens': self.config['vision_max_tokens'],
-                'presence_penalty': self.config['presence_penalty'],
-                'frequency_penalty': self.config['frequency_penalty'],
+                # several choices is not implemented yet
+                **chat_completion_params(self.config['vision_model'], self.config, self.config['vision_max_tokens'], 1),
                 'stream': stream
             }
 
@@ -614,7 +653,7 @@ class OpenAIHelper:
         response = await self.client.chat.completions.create(
             model=self.config['model'],
             messages=messages,
-            temperature=1 if self.config['model'] in O_MODELS else 0.4
+            **({'temperature': 0.4} if is_legacy_model(self.config['model']) else {})
         )
         return response.choices[0].message.content
 
@@ -642,9 +681,8 @@ class OpenAIHelper:
                 return 32_768
             else:
                 return 65_536
-        raise NotImplementedError(
-            f"Max tokens for model {self.config['model']} is not implemented yet."
-        )
+        # current models: conservative context size, only used to decide when to summarise the history
+        return base * 31
 
     # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
     def __count_tokens(self, messages) -> int:
@@ -659,11 +697,9 @@ class OpenAIHelper:
         except KeyError:
             encoding = tiktoken.get_encoding("o200k_base")
 
-        if model in GPT_ALL_MODELS:
-            tokens_per_message = 3
-            tokens_per_name = 1
-        else:
-            raise NotImplementedError(f"""num_tokens_from_messages() is not implemented for model {model}.""")
+        # same per-message overhead for all models; for unknown models it is an estimate
+        tokens_per_message = 3
+        tokens_per_name = 1
         num_tokens = 0
         for message in messages:
             num_tokens += tokens_per_message
@@ -696,9 +732,8 @@ class OpenAIHelper:
         image_file = io.BytesIO(image_bytes)
         image = Image.open(image_file)
         model = self.config['vision_model']
-        if model not in GPT_4_VISION_MODELS:
-            raise NotImplementedError(f"""count_tokens_vision() is not implemented for model {model}.""")
-        
+        # the gpt-4o tile formula below is used as an estimate for other vision models too
+
         w, h = image.size
         if w > h: w, h = h, w
         # this computation follows https://platform.openai.com/docs/guides/vision and https://openai.com/pricing#gpt-4-turbo
